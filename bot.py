@@ -1,112 +1,170 @@
-import os
-import json
-import base64
+import asyncio
 import requests
+from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# --- CONFIGURACIÓN ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-REPO = os.environ.get("REPO")
-DATA_PATH = os.environ.get("DATA_PATH", "data.json")
-GITHUB_API = "https://api.github.com"
+TELEGRAM_TOKEN = "8567347766:AAESVdFSOxJ6bKREMuu47pJCAUg8NiIxn-Q"
 
-# --- FUNCIONES AUXILIARES ---
+# Datos por usuario: {user_id: {"links": [listado de URLs], "min_price": float, "monitoring": bool, "first_run": bool, "last_prices": {}}}
+user_data = {}
 
-def github_get_file(path):
-    url = f"{GITHUB_API}/repos/{REPO}/contents/{path}"
-    r = requests.get(url, headers={"Authorization": f"token {GITHUB_TOKEN}"})
-    data = r.json()
-    content = base64.b64decode(data['content']).decode()
-    return json.loads(content), data['sha']
-
-def github_put_file(path, content_dict, sha=None, message="update data.json"):
-    url = f"{GITHUB_API}/repos/{REPO}/contents/{path}"
-    content = json.dumps(content_dict, indent=2, ensure_ascii=False)
-    payload = {
-        "message": message,
-        "content": base64.b64encode(content.encode()).decode()
-    }
-    if sha:
-        payload["sha"] = sha
-    r = requests.put(url, headers={"Authorization": f"token {GITHUB_TOKEN}"}, json=payload)
-    r.raise_for_status()
-
-def load_data():
-    try:
-        data, sha = github_get_file(DATA_PATH)
-        return data, sha
-    except:
-        return {"articles": {}, "next_id": 1}, None
-
-# --- COMANDOS TELEGRAM ---
+# === COMANDOS ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data[user_id] = {
+        "links": [],
+        "min_price": None,
+        "monitoring": False,
+        "first_run": True,
+        "last_prices": {}
+    }
     await update.message.reply_text(
-        "👋 Bienvenido. Envíame un link y luego te pediré el precio mínimo que deseas.\n"
-        "Comandos:\n"
-        "/list - Ver tus artículos\n"
-        "/clear - Borrar todo"
+        "👋 ¡Hola! Envíame los links de los productos que quieras monitorear (Amazon o Mercado Libre).\n"
+        "Cuando termines, envía el precio mínimo con el comando:\n"
+        "`/precio 1200`\n"
+        "Y para iniciar el monitoreo usa:\n"
+        "`/iniciar`\n\n"
+        "Puedes detenerlo con `/detener`",
+        parse_mode="Markdown"
     )
 
-# --- Mensaje de texto recibido (link) ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def agregar_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
     text = update.message.text.strip()
-    if text.startswith("http"):
-        context.user_data["link"] = text
-        await update.message.reply_text("🔢 Ingresa el precio mínimo deseado (solo número):")
-        return
 
-    # Si el usuario envía el precio
-    if text.replace(".", "", 1).isdigit():
-        price = float(text)
-        link = context.user_data.get("link")
-        if not link:
-            await update.message.reply_text("❌ Primero envíame un link.")
-            return
+    if not text.startswith("http"):
+        return await update.message.reply_text("❌ Envíame un link válido que empiece con http o https.")
 
-        data, sha = load_data()
-        nid = data["next_id"]
-        data["articles"][str(nid)] = {
-            "title": f"Artículo {nid}",
-            "target_price": price,
-            "links": [link],
-            "chat_id": update.effective_chat.id,
-            "active": True
-        }
-        data["next_id"] = nid + 1
-        github_put_file(DATA_PATH, data, sha, message=f"add item {nid}")
-        await update.message.reply_text(f"✅ Guardado: {link}\nPrecio objetivo: {price}")
-        context.user_data.clear()
-        return
+    user_data.setdefault(user_id, {
+        "links": [],
+        "min_price": None,
+        "monitoring": False,
+        "first_run": True,
+        "last_prices": {}
+    })
 
-    await update.message.reply_text("❌ Envíame un link o un número de precio.")
+    user_data[user_id]["links"].append(text)
+    await update.message.reply_text(f"✅ Link agregado ({len(user_data[user_id]['links'])} total).")
 
-async def list_articles(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data, _ = load_data()
-    if not data["articles"]:
-        await update.message.reply_text("No tienes artículos guardados.")
-        return
-    msg = "📦 Artículos guardados:\n"
-    for aid, a in data["articles"].items():
-        msg += f"\nID {aid}: {a['title']} (${a['target_price']})\nLinks: {len(a['links'])}"
-    await update.message.reply_text(msg)
+async def set_precio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if len(context.args) == 0:
+        return await update.message.reply_text("Debes indicar el precio mínimo, por ejemplo: `/precio 1200`", parse_mode="Markdown")
 
-async def clear_articles(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data, sha = load_data()
-    data["articles"] = {}
-    data["next_id"] = 1
-    github_put_file(DATA_PATH, data, sha, message="clear all")
-    await update.message.reply_text("🧹 Todos los artículos fueron eliminados.")
+    try:
+        precio = float(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("❌ Precio inválido. Usa solo números.")
 
-# --- MAIN ---
+    user_data.setdefault(user_id, {
+        "links": [],
+        "min_price": None,
+        "monitoring": False,
+        "first_run": True,
+        "last_prices": {}
+    })
+    user_data[user_id]["min_price"] = precio
+    await update.message.reply_text(f"💰 Precio mínimo establecido en ${precio:.2f}")
+
+async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    data = user_data.get(user_id)
+
+    if not data or not data["links"]:
+        return await update.message.reply_text("❌ No has agregado ningún link.")
+    if data["min_price"] is None:
+        return await update.message.reply_text("❌ No has establecido un precio mínimo con `/precio`.")
+
+    if data["monitoring"]:
+        return await update.message.reply_text("⏳ Ya estoy monitoreando tus productos.")
+
+    data["monitoring"] = True
+    await update.message.reply_text("✅ Monitoreo iniciado. Revisaré los precios cada 10 minutos 🔄")
+    asyncio.create_task(monitor_precios(update, context, user_id))
+
+async def detener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id in user_data:
+        user_data[user_id]["monitoring"] = False
+        await update.message.reply_text("🛑 Monitoreo detenido.")
+    else:
+        await update.message.reply_text("No hay monitoreo activo.")
+
+# === FUNCIONES DE MONITOREO ===
+
+async def monitor_precios(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Revisa los precios cada 10 minutos mientras monitoring=True"""
+    while user_data.get(user_id, {}).get("monitoring", False):
+        await revisar_precios(update, context, user_id)
+        await asyncio.sleep(600)  # 10 minutos
+
+async def revisar_precios(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    data = user_data.get(user_id)
+    links = data["links"]
+    min_price = data["min_price"]
+    first_run = data.get("first_run", True)
+    last_prices = data.setdefault("last_prices", {})
+
+    if first_run:
+        await update.message.reply_text("🔍 Revisando precios por primera vez...")
+    else:
+        print(f"Revisando precios en segundo plano para {user_id}")
+
+    for link in links:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(link, headers=headers, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            current_price = None
+
+            if "amazon" in link:
+                price_tag = soup.find("span", class_="a-price-whole")
+                if price_tag:
+                    current_price = float(price_tag.text.replace(",", "").replace("$", "").strip())
+            elif "mercadolibre" in link:
+                price_tag = soup.find("span", class_="andes-money-amount__fraction")
+                if price_tag:
+                    current_price = float(price_tag.text.replace(",", "").replace("$", "").strip())
+
+            if current_price is None:
+                await update.message.reply_text(f"⚠️ No pude obtener el precio de:\n{link}")
+                continue
+
+            last_price = last_prices.get(link)
+            last_prices[link] = current_price
+
+            # Lógica de notificación
+            if first_run:
+                await update.message.reply_text(f"💰 Precio actual de:\n{link}\n➡️ ${current_price}")
+            elif last_price and current_price < last_price:
+                await update.message.reply_text(
+                    f"🎉 ¡El precio bajó!\nAntes: ${last_price}\nAhora: ${current_price}\n🔗 {link}"
+                )
+            elif current_price <= min_price:
+                await update.message.reply_text(
+                    f"✅ ¡Precio por debajo del mínimo!\nActual: ${current_price}\n🔗 {link}"
+                )
+            # No se envía nada si no cumple las condiciones
+
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Error al revisar {link}: {e}")
+
+    data["first_run"] = False  # Después de la primera revisión
+
+# === INICIO DEL BOT ===
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("list", list_articles))
-    app.add_handler(CommandHandler("clear", clear_articles))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("precio", set_precio))
+    app.add_handler(CommandHandler("iniciar", iniciar))
+    app.add_handler(CommandHandler("detener", detener))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, agregar_link))
+
     print("🤖 Bot corriendo...")
     app.run_polling()
 
